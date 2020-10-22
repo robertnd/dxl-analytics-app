@@ -1,0 +1,641 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "(SO0038) - Real-time Web Analytics with Kinesis Analytics: This solution provides an auto scaled group of beacon servers and dashboard for real-time analytics of web site traffic.",
+  "Parameters": {
+    "VpcCidr": {
+      "Type": "String",
+      "Description": "CIDR block for new VPC for analytics staackk",
+      "Default": "172.31.0.0/16"
+    },
+    "Subnet0Cidr": {
+      "Type": "String",
+      "Description": "CIDR block for new VPC public subnet #1.",
+      "Default": "10.0.0.0/24"
+    },
+    "Subnet1Cidr": {
+      "Type": "String",
+      "Description": "CIDR block for new VPC public subnet #2.",
+      "Default": "10.0.1.0/24"
+    },
+    "AZ0": {
+      "Type": "String",
+      "Description": "Optional: Availability Zone number for public subnet #1.",
+      "Default": 0,
+      "AllowedValues": [0, 1, 2, 3, 4, 5]
+    },
+    "NodeSize": {
+      "Type": "String",
+      "Description": "Number of requests per minute that each beacon node will support (50K = t2.medium, 100K = m5.large).",
+      "Default": "50K",
+      "AllowedValues": ["50K", "100K"]
+    }
+  },
+  "Mappings": {
+    "SourceCode": {
+      "General": {
+        "S3Bucket": "CODE_BUCKET",
+        "KeyPrefix": "SOLUTION_NAME/CODE_VERSION"
+      }
+    },
+    "Sizing": {
+      "50K": {
+        "InstanceType": "t2.medium",
+        "PacketsPerMinHigh": 200000,
+        "PacketsPerMinLow": 80000
+      },
+      "100K": {
+        "InstanceType": "m5.large",
+        "PacketsPerMinHigh": 500000,
+        "PacketsPerMinLow": 200000
+      }
+    },
+    "Solution": {
+      "Data": {
+        "ID": "SO0038",
+        "Version": "1.1.1",
+        "SendAnonymousUsageData": "True"
+      }
+    }
+  },
+  "Resources": {
+    "VPC": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": {
+          "Ref": "VpcCidr"
+        },
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-vpc"
+            }
+          }
+        ]
+      }
+    },
+    "Subnet0": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "CidrBlock": "172.31.48.0/24",
+        "VpcId": { "Ref": "VPC" }
+      },
+      "Tags": [
+        {
+          "Key": "Name",
+          "Value": {
+            "Fn::Sub": "${AWS::StackName}-subnet-0"
+          }
+        }
+      ]
+    },
+    "kinesisInternetGateway": {
+      "Type": "AWS::EC2::InternetGateway",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-ig"
+            }
+          }
+        ]
+      }
+    },
+    "GatewayAttachment": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": {
+        "InternetGatewayId": {
+          "Ref": "kinesisInternetGateway"
+        },
+        "VpcId": {
+          "Ref": "VPC"
+        }
+      }
+    },
+    "RouteTable": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VPC"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-public-route-table"
+            }
+          }
+        ]
+      }
+    },
+    "PublicRoute": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": {
+          "Ref": "kinesisInternetGateway"
+        },
+        "RouteTableId": {
+          "Ref": "RouteTable"
+        }
+      },
+      "DependsOn": "GatewayAttachment"
+    },
+    "Subnet0RouteTableAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "RouteTable"
+        },
+        "SubnetId": {
+          "Ref": "Subnet0"
+        }
+      }
+    },
+    "AnalyticsBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "Properties": {}
+    },
+    "AppKinesisRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["ec2.amazonaws.com"]
+              },
+              "Action": ["sts:AssumeRole"]
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "puttofirehose",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["firehose:PutRecord", "firehose:PutRecordBatch"],
+                  "Resource": [
+                    {
+                      "Fn::GetAtt": ["DeliveryStream", "Arn"]
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "PolicyName": "ssmagent",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ssm:DescribeAssociation",
+                    "ssm:GetDeployablePatchSnapshotForInstance",
+                    "ssm:GetDocument",
+                    "ssm:GetManifest",
+                    "ssm:GetParameters",
+                    "ssm:ListAssociations",
+                    "ssm:ListInstanceAssociations",
+                    "ssm:PutInventory",
+                    "ssm:PutComplianceItems",
+                    "ssm:PutConfigurePackageResult",
+                    "ssm:UpdateAssociationStatus",
+                    "ssm:UpdateInstanceAssociationStatus",
+                    "ssm:UpdateInstanceInformation"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2messages:AcknowledgeMessage",
+                    "ec2messages:DeleteMessage",
+                    "ec2messages:FailMessage",
+                    "ec2messages:GetEndpoint",
+                    "ec2messages:GetMessages",
+                    "ec2messages:SendReply"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["cloudwatch:PutMetricData"],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["ec2:DescribeInstanceStatus"],
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": {
+                      "ec2:ResourceTag/tag:aws:cloudformation:stack-name": {
+                        "Ref": "AWS::StackName"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "Metadata": {
+        "cfn_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "W11",
+              "reason": "* resource is required for logs"
+            }
+          ]
+        }
+      }
+    },
+    "DeliveryStreamRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["firehose.amazonaws.com"]
+              },
+              "Action": ["sts:AssumeRole"]
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "s3Access",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:AbortMultipartUpload",
+                    "s3:GetBucketLocation",
+                    "s3:GetObject",
+                    "s3:ListBucket",
+                    "s3:ListBucketMultipartUploads",
+                    "s3:PutObject"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "${AnalyticsBucket.Arn}"
+                    },
+                    {
+                      "Fn::Sub": "${AnalyticsBucket.Arn}/*"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "",
+                  "Effect": "Allow",
+                  "Action": ["logs:PutLogEvents"],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*:log-stream:*"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "Metadata": {
+        "cfn_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "w11",
+              "reason": "/* is required for logs"
+            }
+          ]
+        },
+        "AWS::CloudFormation::Designer": {
+          "id": "16d8ed31-0608-4edb-85b6-62e9c69fbe2a"
+        }
+      }
+    },
+    "DeliveryStream": {
+      "Type": "AWS::KinesisFirehose::DeliveryStream",
+      "Properties": {
+        "DeliveryStreamType": "DirectPut",
+        "S3DestinationConfiguration": {
+          "BucketARN": {
+            "Fn::Sub": "${AnalyticsBucket.Arn}"
+          },
+          "BufferingHints": {
+            "IntervalInSeconds": "60",
+            "SizeInMBs": "1"
+          },
+          "CompressionFormat": "UNCOMPRESSED",
+          "RoleARN": {
+            "Fn::GetAtt": ["DeliveryStreamRole", "Arn"]
+          }
+        }
+      },
+      "Metadata": {
+        "AWS::CloudFormation::Designer": {
+          "id": "37ee278b-7eb1-40a0-9c0b-8a82ab3191bd"
+        }
+      }
+    },
+    "OutputStream": {
+      "Type": "AWS::Kinesis::Stream",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-OutputStream"
+        },
+        "RetentionPeriodHours": 24,
+        "ShardCount": 1
+      }
+    },
+    "KinesisAnalyticsRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["kinesisanalytics.amazonaws.com"]
+              },
+              "Action": ["sts:AssumeRole"]
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "kinesisaccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ReadInputStream",
+                  "Effect": "Allow",
+                  "Action": [
+                    "firehose:DescribeDeliveryStream",
+                    "firehose:Get*"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::GetAtt": ["DeliveryStream", "Arn"]
+                    }
+                  ]
+                },
+                {
+                  "Sid": "LisInputStream",
+                  "Effect": "Allow",
+                  "Action": ["firehose:ListDeliveryStreams"],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "WriteOutputStram",
+                  "Effect": "Allow",
+                  "Action": [
+                    "kinesis:PutRecord",
+                    "kinesis:PutRecords",
+                    "kinesis:DescribeStream"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::GetAtt": ["OutputStream", "Arn"]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "KinesisAnalyticsApp": {
+      "Type": "AWS::KinesisAnalytics::Application",
+      "Properties": {
+        "ApplicationName": {
+          "Fn::Sub": "${AWS::StackName}-WebMetricsApplication"
+        },
+        "ApplicationDescription": "Kineis Analytics Web Metrics Solution Accelerator",
+        "ApplicationCode": {
+          "Fn::Sub": "CREATE STREAM \"DESTINATION_SQL_STREAM\"(\n    MetricType VARCHAR(16),\n    EventTimestamp BIGINT,\n    MetricItem VARCHAR(1024),\n    UnitValueInt BIGINT,\n    UnitValueFloat DOUBLE);\n\n--Active Visitors\nCREATE OR REPLACE PUMP \"VISTOR_COUNTER_PUMP\" AS\nINSERT INTO \"DESTINATION_SQL_STREAM\" ( MetricType, EventTimestamp, UnitValueInt)\nSELECT STREAM 'visitor_count', UNIX_TIMESTAMP(weblogs.window_time), COUNT(weblogs.clientid) FROM (\n    SELECT STREAM DISTINCT\n        monotonic (STEP (CHAR_TO_TIMESTAMP('dd/MMM/yyyy:HH:mm:ss z',\"WASA_001\".\"datetime\") by INTERVAL '60' SECOND)) AS window_time,\n        STEP (\"WASA_001\".ROWTIME BY INTERVAL '60' SECOND),\n        \"WASA_001\".\"clientid\" as clientid\n    FROM \"WASA_001\") as weblogs\n    GROUP BY\n    window_time;\n\n--\"Top\" Page Views (group_rank?)\nCREATE OR REPLACE PUMP \"PAGEVIEWS_PUMP\" AS\nINSERT INTO \"DESTINATION_SQL_STREAM\" ( MetricType, EventTimestamp, MetricItem, UnitValueInt)\nSELECT 'top_pages', UNIX_TIMESTAMP(eventTimestamp), page, page_count FROM (\n    SELECT stream\n        weblogs.\"page\" as page,\n        count(*) as page_count,\n        STEP (CHAR_TO_TIMESTAMP('dd/MMM/yyyy:HH:mm:ss z',weblogs.\"datetime\") by INTERVAL '10' SECOND) as eventTimestamp\n    FROM \"WASA_001\" weblogs\n    WHERE weblogs.\"page\" is not NULL\n    GROUP BY\n        STEP (weblogs.ROWTIME BY INTERVAL '10' SECOND),\n        STEP (CHAR_TO_TIMESTAMP('dd/MMM/yyyy:HH:mm:ss z',weblogs.\"datetime\") by INTERVAL '10' SECOND),\n        weblogs.\"page\"\n    HAVING count(*) > 1\n    ORDER BY STEP (weblogs.ROWTIME BY INTERVAL '10' SECOND), page_count desc\n);\n\n-- Events --\nCREATE STREAM \"EVENT_STREAM\"(\n    MetricType VARCHAR(16),\n    EventTimestamp BIGINT,\n    MetricItem VARCHAR(1024),\n    UnitValueInt BIGINT);\nCREATE OR REPLACE PUMP \"SHARED_EVENT_PUMP\" AS\nINSERT INTO \"EVENT_STREAM\" ( MetricType, EventTimestamp, MetricItem, UnitValueInt)\nSELECT 'event_count', UNIX_TIMESTAMP(eventTimestamp), event, event_count FROM (\n    SELECT STREAM\n        STEP (CHAR_TO_TIMESTAMP('dd/MMM/yyyy:HH:mm:ss z',weblogs.\"datetime\") by INTERVAL '10' SECOND) as eventTimestamp,\n        weblogs.\"event\" event,\n        count(*) event_count\n    FROM \"WASA_001\" weblogs\n    WHERE weblogs.\"event\" is not NULL\n    GROUP BY\n        weblogs.\"event\",\n        STEP (weblogs.ROWTIME BY INTERVAL '10' SECOND),\n        STEP (CHAR_TO_TIMESTAMP('dd/MMM/yyyy:HH:mm:ss z',weblogs.\"datetime\") by INTERVAL '10' SECOND)\n);\n\nCREATE OR REPLACE PUMP \"EVENT_PUMP\" AS\nINSERT INTO \"DESTINATION_SQL_STREAM\" (MetricType, EventTimestamp, MetricItem, UnitValueInt)\nSELECT STREAM MetricType, EventTimestamp, MetricItem, UnitValueInt FROM \"EVENT_STREAM\";\n\n--Anomaly detection for event distribution\nCREATE STREAM \"ANOMALY_TEMP_STREAM\"(\n    EventTimestampString VARCHAR(16),\n    MetricItem VARCHAR(1024),\n    MetricItemInt INTEGER,\n    UnitValueInt BIGINT,\n    AnomalyScore DOUBLE);\nCREATE OR REPLACE PUMP \"INTERMEDIATE_ANOMALY_EVENT_PUMP\" AS\nINSERT INTO \"ANOMALY_TEMP_STREAM\" ( EventTimestampString, MetricItem, MetricItemInt, UnitValueInt, AnomalyScore)\nSELECT STREAM *\nFROM TABLE (\n    RANDOM_CUT_FOREST(\n        CURSOR(SELECT STREAM\n            CAST(EventTimestamp AS VARCHAR(16)),\n            MetricItem,\n            case MetricItem\n            WHEN 'click' THEN 1\n            WHEN 'pageview' THEN 2\n            WHEN 'conversion' THEN 3\n            WHEN 'exception' THEN 4\n            WHEN 'playvideo' THEN 5\n            WHEN 'login' THEN 6\n            WHEN 'logoff' THEN 7\n            ELSE 0\n            END,\n            UnitValueInt FROM \"EVENT_STREAM\"),\n            100,\n            256,\n            100000,\n            1)\n    );\n\nCREATE OR REPLACE PUMP \"ANOMALY_EVENT_PUMP\" AS\nINSERT INTO \"DESTINATION_SQL_STREAM\" (MetricType, EventTimestamp, MetricItem, UnitValueFloat)\nSELECT 'event_anomaly', CAST(EventTimestampString AS BIGINT), MetricItem || ':' || CAST(UnitValueInt as VARCHAR(16)), AnomalyScore FROM (\n    SELECT STREAM\n        EventTimestampString,\n        MetricItem,\n        UnitValueInt,\n        AnomalyScore\n    FROM \"ANOMALY_TEMP_STREAM\"\n    WHERE AnomalyScore > 2.0\n);\n\n--agents\nCREATE OR REPLACE PUMP \"AGENT_PUMP\" AS\nINSERT INTO \"DESTINATION_SQL_STREAM\" ( MetricType, EventTimestamp, MetricItem, UnitValueInt)\nSELECT 'agent_count', UNIX_TIMESTAMP(eventTimestamp), agent, agent_count FROM (\n    SELECT STREAM\n        weblogs.\"agent\" as agent,\n        count(*) as agent_count,\n        STEP (weblogs.ROWTIME BY INTERVAL '10' SECOND) as eventTimestamp\n    FROM \"WASA_001\" weblogs\n    WHERE weblogs.\"agent\" NOT like 'ELB-HealthChecker%'\n    GROUP BY\n        weblogs.\"agent\",\n        STEP (weblogs.ROWTIME BY INTERVAL '10' SECOND)\n);\n\n--referrer (-r) list\nCREATE OR REPLACE PUMP \"REFERRER_PUMP\" AS\nINSERT INTO \"DESTINATION_SQL_STREAM\" ( MetricType, EventTimestamp, MetricItem, UnitValueInt)\nSELECT 'referral_count', UNIX_TIMESTAMP(eventTimestamp), referrer, referrer_count FROM (\n    SELECT stream\n        weblogs.\"referrer\" as referrer,\n        count(*) as referrer_count,\n        STEP (CHAR_TO_TIMESTAMP('dd/MMM/yyyy:HH:mm:ss z',weblogs.\"datetime\") by INTERVAL '10' SECOND) as eventTimestamp\n    FROM \"WASA_001\" weblogs\n    GROUP BY\n        STEP (weblogs.ROWTIME BY INTERVAL '10' SECOND),\n        STEP (CHAR_TO_TIMESTAMP('dd/MMM/yyyy:HH:mm:ss z',weblogs.\"datetime\") by INTERVAL '10' SECOND),\n        weblogs.\"referrer\"\n    ORDER BY STEP (weblogs.ROWTIME BY INTERVAL '10' SECOND), referrer_count desc\n);\n\n--Hourly Events\nCREATE OR REPLACE PUMP \"HOURLY_EVENT_PUMP\" AS\nINSERT INTO \"DESTINATION_SQL_STREAM\" ( MetricType, EventTimestamp, MetricItem, UnitValueInt)\nSELECT 'hourly_events', EventTimestamp, MetricItem, hourly_total FROM (\n    SELECT STREAM\n        SUM(UnitValueInt) OVER hourly_window as hourly_total,\n        MetricItem,\n        EventTimestamp\n    FROM \"EVENT_STREAM\"\n    WINDOW hourly_window AS (\n        PARTITION BY MetricItem\n            RANGE INTERVAL '1' HOUR PRECEDING\n    )\n);\n"
+        },
+        "Inputs": [
+          {
+            "NamePrefix": "WASA",
+            "InputSchema": {
+              "RecordColumns": [
+                {
+                  "Name": "host",
+                  "SqlType": "VARCHAR(16)",
+                  "Mapping": "$.host"
+                },
+                {
+                  "Name": "datetime",
+                  "SqlType": "VARCHAR(32)",
+                  "Mapping": "$.datetime"
+                },
+                {
+                  "Name": "request",
+                  "SqlType": "VARCHAR(256)",
+                  "Mapping": "$.request"
+                },
+                {
+                  "Name": "response",
+                  "SqlType": "INTEGER",
+                  "Mapping": "$.response"
+                },
+                {
+                  "Name": "bytes",
+                  "SqlType": "INTEGER",
+                  "Mapping": "$.bytes"
+                },
+                {
+                  "Name": "referrer",
+                  "SqlType": "VARCHAR(32)",
+                  "Mapping": "$.referrer"
+                },
+                {
+                  "Name": "agent",
+                  "SqlType": "VARCHAR(128)",
+                  "Mapping": "$.agent"
+                },
+                {
+                  "Name": "event",
+                  "SqlType": "VARCHAR(16)",
+                  "Mapping": "$.event"
+                },
+                {
+                  "Name": "clientid",
+                  "SqlType": "VARCHAR(256)",
+                  "Mapping": "$.clientid"
+                },
+                {
+                  "Name": "page",
+                  "SqlType": "VARCHAR(256)",
+                  "Mapping": "$.page"
+                },
+                {
+                  "Name": "custom_metric_name",
+                  "SqlType": "VARCHAR(256)",
+                  "Mapping": "$.custom_metric_name"
+                },
+                {
+                  "Name": "custom_metric_int_value",
+                  "SqlType": "INTEGER",
+                  "Mapping": "$.custom_metric_int_value"
+                },
+                {
+                  "Name": "custom_metric_float_value",
+                  "SqlType": "DOUBLE",
+                  "Mapping": "$.custom_metric_float_value"
+                },
+                {
+                  "Name": "custom_metric_string_value",
+                  "SqlType": "VARCHAR(256)",
+                  "Mapping": "$.custom_metric_string_value"
+                }
+              ],
+              "RecordFormat": {
+                "RecordFormatType": "JSON",
+                "MappingParameters": {
+                  "JSONMappingParameters": {
+                    "RecordRowPath": "$"
+                  }
+                }
+              }
+            },
+            "KinesisFirehoseInput": {
+              "ResourceARN": {
+                "Fn::Sub": "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${DeliveryStream}"
+              },
+              "RoleARN": {
+                "Fn::GetAtt": ["KinesisAnalyticsRole", "Arn"]
+              }
+            }
+          }
+        ]
+      },
+      "Metadata": {
+        "AWS::CloudFormation::Designer": {
+          "id": "62e61eca-e2d1-4837-9204-d47b227e9528"
+        }
+      }
+    },
+    "KinesisAnalyticsAppAnomalyOutput": {
+      "Type": "AWS::KinesisAnalytics::ApplicationOutput",
+      "Properties": {
+        "ApplicationName": {
+          "Ref": "KinesisAnalyticsApp"
+        },
+        "Output": {
+          "DestinationSchema": {
+            "RecordFormatType": "JSON"
+          },
+          "KinesisStreamsOutput": {
+            "ResourceARN": {
+              "Fn::GetAtt": ["OutputStream", "Arn"]
+            },
+            "RoleARN": {
+              "Fn::GetAtt": ["KinesisAnalyticsRole", "Arn"]
+            }
+          },
+          "Name": "DESTINATION_SQL_STREAM"
+        }
+      },
+      "Metadata": {
+        "AWS::CloudFormation::Designer": {
+          "id": "fcccc9d8-859e-440c-bfae-0300661b102c"
+        }
+      }
+    },
+    "KinesisAnalyticsStarter": {
+      "Type": "Custom::LoadLambda",
+      "DependsOn": ["KinesisAnalyticsAppAnomalyOutput"],
+      "Properties": {
+        "ServiceToken": {
+          "Fn::GetAtt": ["CustomResourceHelper", "Arn"]
+        },
+        "Region": {
+          "Ref": "AWS::Region"
+        },
+        "ApplicationName": {
+          "Ref": "KinesisAnalyticsApp"
+        },
+        "CustomResourceAction": "StartKinesisApplication",
+        "UUID": {
+          "Fn::GetAtt": ["GenerateUUID", "UUID"]
+        }
+      },
+      "Metadata": {
+        "AWS::CloudFormation::Designer": {
+          "id": "d69dfc5e-6a22-422d-84e6-956388d4f101"
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "DashboardUrl": {
+      "Description": "The URL to the Dashboard.",
+      "Value": {
+        "Fn::Sub": "https://${WebsiteDistribution.DomainName}/index.html"
+      }
+    },
+    "DashboardUserName": {
+      "Value": {
+        "Ref": "UserName"
+      }
+    },
+    "DataGenerator": {
+      "Description": "Generate test data command.",
+      "Value": {
+        "Fn::Sub": "python ./test-beacon.py http://${ApplicationLoadBalancer.DNSName}/beacon 20000 0.5"
+      }
+    },
+    "BeaconDNS": {
+      "Description": "DNS name for beacon web server ALB.",
+      "Value": {
+        "Fn::Sub": "${ApplicationLoadBalancer.DNSName}"
+      }
+    },
+    "BeaconServerUrl": {
+      "Description": "URL for beacon web servers.",
+      "Value": {
+        "Fn::Sub": "http://${ApplicationLoadBalancer.DNSName}/beacon"
+      }
+    },
+    "TestScriptUrl": {
+      "Description": "Link to download test-beacon.py for testing your beacon servers.",
+      "Value": {
+        "Fn::Sub": "https://${WebsiteDistribution.DomainName}/test-beacon.py"
+      }
+    }
+  }
+}

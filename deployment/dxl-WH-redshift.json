@@ -1,0 +1,246 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Repository for DXL Streams",
+  "Mappings": {
+    "SubnetConfig": {
+      "VPC": { "CIDR": "172.31.0.0/16" },
+      "Public": { "CIDR": "172.31.48.0/24" }
+    }
+  },
+  "Parameters": {
+    "KinesisInboundTraffic": {
+      "Description": "Allow Kinesis Firehose traffic to the cluster from this CIDR range.",
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "18",
+      "Default": "52.70.63.192/27",
+      "AllowedPattern": "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})",
+      "ConstraintDescription": "must be a valid CIDR range of the form x.x.x.x/x."
+    },
+    "QuickSightInboundTraffic": {
+      "Description": "Allow QuickSight traffic to the cluster from this CIDR range.",
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "18",
+      "Default": "52.23.63.224/27",
+      "AllowedPattern": "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})",
+      "ConstraintDescription": "must be a valid CIDR range of the form x.x.x.x/x."
+    },
+    "PortNumber": {
+      "Description": "The port number on which the cluster accepts incoming connections.",
+      "Type": "Number",
+      "Default": "5439"
+    }
+  },
+  "Resources": {
+    "S3Bucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {}
+    },
+
+    "RedshiftCluster": {
+      "Type": "AWS::Redshift::Cluster",
+      "DependsOn": "AttachGateway",
+      "Properties": {
+        "ClusterType": "single-node",
+        "NodeType": "dc2.large",
+        "DBName": "dxl_streams",
+        "MasterUsername": "awsuser",
+        "MasterUserPassword": "",
+        "ClusterParameterGroupName": { "Ref": "RedshiftClusterParameterGroup" },
+        "VpcSecurityGroupIds": [{ "Ref": "SecurityGroup" }],
+        "ClusterSubnetGroupName": { "Ref": "RedshiftClusterSubnetGroup" },
+        "PubliclyAccessible": "true",
+        "Port": { "Ref": "PortNumber" },
+        "IamRoles": [
+          {
+            "Fn::GetAtt": ["KinesisAndRedshiftIAMRole", "Arn"]
+          }
+        ]
+      }
+    },
+    "RedshiftClusterParameterGroup": {
+      "Type": "AWS::Redshift::ClusterParameterGroup",
+      "Properties": {
+        "Description": "Cluster parameter group",
+        "ParameterGroupFamily": "redshift-1.0",
+        "Parameters": [
+          {
+            "ParameterName": "enable_user_activity_logging",
+            "ParameterValue": "true"
+          }
+        ]
+      }
+    },
+    "RedshiftClusterSubnetGroup": {
+      "Type": "AWS::Redshift::ClusterSubnetGroup",
+      "Properties": {
+        "Description": "Cluster subnet group",
+        "SubnetIds": [{ "Ref": "PublicSubnet" }]
+      }
+    },
+    "VPC": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": "172.31.0.0/16"
+      }
+    },
+    "PublicSubnet": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "CidrBlock": "172.31.48.0/24",
+        "VpcId": { "Ref": "VPC" }
+      }
+    },
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Security group",
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": { "Ref": "PortNumber" },
+            "ToPort": { "Ref": "PortNumber" },
+            "CidrIp": { "Ref": "KinesisInboundTraffic" }
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": { "Ref": "PortNumber" },
+            "ToPort": { "Ref": "PortNumber" },
+            "CidrIp": { "Ref": "QuickSightInboundTraffic" }
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": "22",
+            "ToPort": "22",
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": "80",
+            "ToPort": "80",
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": "8080",
+            "ToPort": "8080",
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "icmp",
+            "FromPort": "-1",
+            "ToPort": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "VpcId": { "Ref": "VPC" }
+      }
+    },
+    "dxlInternetGateway": {
+      "Type": "AWS::EC2::InternetGateway"
+    },
+    "AttachGateway": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": {
+        "VpcId": { "Ref": "VPC" },
+        "InternetGatewayId": { "Ref": "dxlInternetGateway" }
+      }
+    },
+    "PublicRouteTable": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VPC"
+        }
+      }
+    },
+    "PublicRoute": {
+      "Type": "AWS::EC2::Route",
+      "DependsOn": "AttachGateway",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "PublicRouteTable"
+        },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": {
+          "Ref": "dxlInternetGateway"
+        }
+      }
+    },
+    "PublicSubnetRouteTableAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnet"
+        },
+        "RouteTableId": {
+          "Ref": "PublicRouteTable"
+        }
+      }
+    },
+    "KinesisAndRedshiftIAMRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["redshift.amazonaws.com"]
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": "root",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:*", "kinesis:*"],
+                  "Resource": ["*"]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "ClusterEndpoint": {
+      "Description": "Cluster endpoint",
+      "Value": {
+        "Fn::Join": [
+          ":",
+          [
+            { "Fn::GetAtt": ["RedshiftCluster", "Endpoint.Address"] },
+            { "Fn::GetAtt": ["RedshiftCluster", "Endpoint.Port"] }
+          ]
+        ]
+      }
+    },
+    "ClusterName": {
+      "Description": "Name of cluster",
+      "Value": { "Ref": "RedshiftCluster" }
+    },
+    "ParameterGroupName": {
+      "Description": "Name of parameter group",
+      "Value": { "Ref": "RedshiftClusterParameterGroup" }
+    },
+    "RedshiftClusterSubnetGroupName": {
+      "Description": "Name of cluster subnet group",
+      "Value": { "Ref": "RedshiftClusterSubnetGroup" }
+    },
+    "RedshiftClusterSecurityGroupName": {
+      "Description": "Name of cluster security group",
+      "Value": { "Ref": "SecurityGroup" }
+    }
+  }
+}
